@@ -92,20 +92,27 @@ class Connection(object):
             raise ConnectionError("Error %s while writing to socket. %s." % \
                 (_errno, errmsg))
 
-    def read(self, length=None):
+    def read(self, length=None, respect_again=False):
         """
-        Read a line from the socket is length is None,
+        Read a line from the socket if length is None,
         otherwise read ``length`` bytes
         """
         try:
             if length is not None:
                 return self._fp.read(length)
             return self._fp.readline()
+        except socket.timeout:
+            raise
         except socket.error, e:
-            self.disconnect()
-            if e.args and e.args[0] == errno.EAGAIN:
-                raise ConnectionError("Error while reading from socket: %s" % \
-                    e.args[1])
+            is_again = e.args and e.args[0] == errno.EAGAIN
+            if respect_again:
+                if is_again:
+                    raise
+            else:
+                self.disconnect()
+                if is_again:
+                    raise ConnectionError(
+                            "Error while reading from socket: %s" % e.args[1])
         return ''
 
 def list_or_args(command, keys, args):
@@ -339,9 +346,10 @@ class Redis(threading.local):
             **options
             )
 
-    def _parse_response(self, command_name, catch_errors):
+    def _parse_response(self, command_name, catch_errors, respect_again=False):
         conn = self.connection
-        response = conn.read()[:-2] # strip last two characters (\r\n)
+        # strip last two characters (\r\n)
+        response = conn.read(respect_again=respect_again)[:-2]
         if not response:
             self.connection.disconnect()
             raise ConnectionError("Socket closed on remote end")
@@ -394,9 +402,11 @@ class Redis(threading.local):
 
         raise InvalidResponse("Unknown response type for: %s" % command_name)
 
-    def parse_response(self, command_name, catch_errors=False, **options):
+    def parse_response(self, command_name, catch_errors=False,
+            respect_again=False, **options):
         "Parses a response from the Redis server"
-        response = self._parse_response(command_name, catch_errors)
+        response = self._parse_response(command_name, catch_errors,
+                                        respect_again=respect_again)
         if command_name in self.RESPONSE_CALLBACKS:
             return self.RESPONSE_CALLBACKS[command_name](response, **options)
         return response
@@ -1329,27 +1339,53 @@ class Redis(threading.local):
         """
         return self.execute_command('PUBLISH', channel, message)
 
-    def listen(self):
-        "Listen for messages on channels this client has been subscribed to"
-        while self.subscribed:
-            r = self.parse_response('LISTEN')
-            if r[0] == 'pmessage':
-                msg = {
+    def _handle_message(self, r):
+        msg = None
+        if r[0] == 'pmessage':
+            msg = {
                 'type': r[0],
                 'pattern': r[1],
                 'channel': r[2],
                 'data': r[3]
                 }
-            else:
-                msg = {
+        else:
+            msg = {
                 'type': r[0],
                 'pattern': None,
                 'channel': r[1],
                 'data': r[2]
                 }
-            if r[0] == 'unsubscribe' and r[2] == 0:
-                self.subscribed = False
-            yield msg
+        if r[0] == 'unsubscribe' and r[2] == 0:
+            self.subscribed = False
+        return msg
+
+    def receive(self, block=True):
+        """Receive next message from any subscribed channel.
+
+        :keyword block: By default this call will block until a message is
+           available. If disabled and there are no available messages,
+           the call returns :const:`None` immediately.
+
+        """
+        sock = self.connection._sock
+        not block and sock.setblocking(False)
+        response = None
+        try:
+            try:
+                response = self.parse_response('LISTEN',
+                                               respect_again=not block)
+            except socket.error, e:
+                if e.args and e.args[0] != errno.EAGAIN or block:
+                    raise
+            if response is not None:
+                return self._handle_message(response)
+        finally:
+            not block and sock.setblocking(True)  # reset SO_NON_BLOCK
+
+    def listen(self):
+        "Listen for messages on channels this client has been subscribed to"
+        while self.subscribed:
+            yield self.receive(block=True)
 
 
 class Pipeline(Redis):
